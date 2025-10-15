@@ -36,6 +36,7 @@ export JOBID_VAR=${JOBID_VAR:-"procname_uid"}  # or "existing" or "disable"
 
 #export PDSH="pdsh -S -Rssh -w"
 export MOUNT_CMD=${MOUNT_CMD:-"mount -t lustre"}
+export MOUNT_TGT=${MOUNT_TGT:-"mount -t lustre_tgt"}
 export UMOUNT=${UMOUNT:-"umount -d"}
 
 # A switch to enable kptr less restrictively
@@ -1029,10 +1030,12 @@ load_lnet() {
 	# For kmemleak-enabled kernels we need clear all past state
 	# that obviously has nothing to do with this Lustre run
 	# Disable automatic memory scanning to avoid perf hit.
-	if [ -f /sys/kernel/debug/kmemleak ] ; then
-		echo scan=off > /sys/kernel/debug/kmemleak || true
-		echo scan > /sys/kernel/debug/kmemleak || true
-		echo clear > /sys/kernel/debug/kmemleak || true
+	if [[ -w $KMEMLEAK ]] ; then
+		if echo scan=off > $KMEMLEAK || echo scan > $KMEMLEAK
+		   echo clear > $KMEMLEAK || true; then
+			echo "kmemleak disabled"
+			export KMEMLEAK=disabled
+		fi
 	fi
 
 	echo Loading modules from $LUSTRE
@@ -1189,16 +1192,20 @@ load_modules_local() {
 	rm -f $OGDB/ogdb-$HOSTNAME
 	$LCTL modules > $OGDB/ogdb-$HOSTNAME
 
-	# 'mount' doesn't look in $PATH, just sbin
-	local mount_lustre=$LUSTRE/utils/mount.lustre
-	if [ -f $mount_lustre ]; then
-		local sbin_mount=$(readlink -f /sbin)/mount.lustre
+	# 'mount' doesn't look in $PATH, it hard-codes /sbin/mount.$FSTYPE
+	local mount_lustre
+	for mount_lustre in $LUSTRE/utils/mount.{lustre,lustre_tgt}; do
+		local sbin_mount=$(readlink -f /sbin)/$(basename $mount_lustre)
+		ls -l $sbin_mount $mount_lustre || true
+		[[ -f $mount_lustre ]] || continue
+		! client_only || [[ ! $mount_lustre =~ tgt ]] || continue
+
 		if grep -qw "$sbin_mount" /proc/mounts; then
 			cmp -s $mount_lustre $sbin_mount || umount $sbin_mount
 		fi
 		if ! grep -qw "$sbin_mount" /proc/mounts; then
-			[ ! -f "$sbin_mount" ] && touch "$sbin_mount"
-			if [ ! -s "$sbin_mount" -a -w "$sbin_mount" ]; then
+			[[ -f "$sbin_mount" ]] || touch "$sbin_mount" || continue
+			if [[ ! -s "$sbin_mount" && -w "$sbin_mount" ]]; then
 				cat <<- EOF > "$sbin_mount"
 				#!/bin/bash
 				#STUB MARK
@@ -1209,13 +1216,22 @@ load_modules_local() {
 				EOF
 				chmod a+x $sbin_mount
 			fi
+			echo "mount --bind $mount_lustre $sbin_mount"
 			mount --bind $mount_lustre $sbin_mount ||
 				error "can't bind $mount_lustre to $sbin_mount"
 			# ignore errors to symlink .libs for read-only /sbin
-			[[ -e /sbin/.libs ]] ||
+			[[ ! -w /sbin || -e /sbin/.libs ]] ||
 				ln -sf $LUSTRE/utils/.libs /sbin/.libs || true
 		fi
-	fi
+	done
+
+	# /sbin/mount.lustre wasn't installed as part of 2.17, nor in Janitor
+	# this may be run before $MDS1_VERSION is set, check version directly
+	local mds1_version=$(lustre_version_code mds1)
+	(( $mds1_version > $(version_code 2.17.53.0) ||
+	   $mds1_version < $(version_code v2_16_53-7-g6493d8997e) )) &&
+	[[ ! $HOSTNAME =~ oleg ]] ||
+		MOUNT_TGT=$MOUNT_CMD
 }
 
 load_modules () {
@@ -2572,7 +2588,7 @@ mount_facet() {
 
 		case $fstype in
 		wbcfs)
-			echo "Start ${facet}: $MOUNT_CMD -v lustre-wbcfs $mntpt"
+			echo "Start ${facet}: $MOUNT_TGT -v lustre-wbcfs $mntpt"
 
 			export OSD_WBC_FSNAME="$FSNAME"
 			export OSD_WBC_INDEX="$index"
@@ -2604,12 +2620,12 @@ mount_facet() {
 				 OSD_WBC_MGS_NID=$OSD_WBC_MGS_NID \
 				 OSD_WBC_PRIMARY_MDT=$OSD_WBC_PRIMARY_MDT \
 				 OSD_WBC_FSNAME=$OSD_WBC_FSNAME \
-				 $MOUNT_CMD -v lustre-wbcfs $mntpt"
+				 $MOUNT_TGT -v lustre-wbcfs $mntpt"
 			;;
 		*)
-			echo "Start ${facet}: $MOUNT_CMD $opts $dm_dev $mntpt"
+			echo "Start ${facet}: $MOUNT_TGT $opts $dm_dev $mntpt"
 			do_facet ${facet} \
-				"mkdir -p $mntpt; $MOUNT_CMD $opts $dm_dev $mntpt"
+				"mkdir -p $mntpt; $MOUNT_TGT $opts $dm_dev $mntpt"
 		esac
 
 		RC=${PIPESTATUS[0]}

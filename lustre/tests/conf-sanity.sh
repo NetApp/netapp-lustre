@@ -2200,7 +2200,7 @@ t32_test() {
 		if [ "$mds1_FSTYPE" == ldiskfs ]; then
 			mopts="loop,$mopts"
 		fi
-		$r $MOUNT_CMD -o $mopts $mdt_dev $tmp/mnt/mdt
+		$r $MOUNT_TGT -o $mopts $mdt_dev $tmp/mnt/mdt
 		$r $LCTL replace_nids $fsname-OST0000 $ostnid || {
 			$r $LCTL dl
 			error_noexit "replace_nids $fsname-OST0000 $ostnid failed"
@@ -2235,7 +2235,7 @@ t32_test() {
 
 	t32_wait_til_devices_gone $node
 
-	$r $MOUNT_CMD -o $mopts $mdt_dev $tmp/mnt/mdt || {
+	$r $MOUNT_TGT -o $mopts $mdt_dev $tmp/mnt/mdt || {
 		$r losetup -a
 		error_noexit "Mounting the MDT"
 		return 1
@@ -2245,7 +2245,7 @@ t32_test() {
 	if $mdt2_is_available; then
 		echo "== mdt2 available =="
 		mopts=mgsnode=$nid,$mopts
-		$r $MOUNT_CMD -o $mopts $mdt2_dev $tmp/mnt/mdt1 || {
+		$r $MOUNT_TGT -o $mopts $mdt2_dev $tmp/mnt/mdt1 || {
 			$r losetup -a
 			error_noexit "Mounting the MDT"
 			return 1
@@ -2282,7 +2282,7 @@ t32_test() {
 		}
 
 		echo "== mount new MDT....$fs2mdsdev =="
-		$r $MOUNT_CMD -o $mopts $fs2mdsdev $tmp/mnt/mdt1 || {
+		$r $MOUNT_TGT -o $mopts $fs2mdsdev $tmp/mnt/mdt1 || {
 			error_noexit "mount mdt1 failed"
 			return 1
 		}
@@ -2358,13 +2358,13 @@ t32_test() {
 		fi
 	fi
 
-	$r $MOUNT_CMD -onomgs -o$mopts $ost_dev $tmp/mnt/ost || {
+	$r $MOUNT_TGT -onomgs -o$mopts $ost_dev $tmp/mnt/ost || {
 		error_noexit "Mounting the OST"
 		return 1
 	}
 
 	if $ost2_is_available; then
-		$r $MOUNT_CMD -onomgs -o$mopts $ost2_dev $tmp/mnt/ost1 || {
+		$r $MOUNT_TGT -onomgs -o$mopts $ost2_dev $tmp/mnt/ost1 || {
 			error_noexit "Mounting the OST2"
 			return 1
 		}
@@ -3164,7 +3164,7 @@ t32_test() {
 		if [ "$mds1_FSTYPE" == ldiskfs ]; then
 			mopts="loop,$mopts"
 		fi
-		$r $MOUNT_CMD -o $mopts $mdt_dev $tmp/mnt/mdt || {
+		$r $MOUNT_TGT -o $mopts $mdt_dev $tmp/mnt/mdt || {
 			error_noexit "Remounting the MDT"
 			return 1
 		}
@@ -3818,8 +3818,8 @@ test_37() {
 	fi
 
 	load_modules
-	mount_op=$(do_facet $SINGLEMDS mount -v -t lustre $opts \
-		$mdsdev_sym $mntpt 2>&1)
+	mount_op=$(do_facet $SINGLEMDS $MOUNT_TGT -v $opts \
+		   $mdsdev_sym $mntpt 2>&1)
 	rc=${PIPESTATUS[0]}
 
 	echo mount_op=$mount_op
@@ -4030,10 +4030,10 @@ test_41c() {
 	#define OBD_FAIL_TGT_MOUNT_RACE 0x716
 	do_facet mds1 "$LCTL set_param fail_loc=0x80000716"
 
-	do_facet mds1 mount -t lustre $mds1dev $mds1mnt $mds1opts &
+	do_facet mds1 $MOUNT_TGT $mds1dev $mds1mnt $mds1opts &
 	local pid=$!
 
-	do_facet mds1 mount -t lustre $mds1dev $mds1mnt $mds1opts
+	do_facet mds1 $MOUNT_TGT $mds1dev $mds1mnt $mds1opts
 	local rc2=$?
 	wait $pid
 	local rc=$?
@@ -4076,10 +4076,10 @@ test_41c() {
 	#define OBD_FAIL_TGT_MOUNT_RACE 0x716
 	do_facet ost1 "$LCTL set_param fail_loc=0x80000716"
 
-	do_facet ost1 mount -t lustre $ost1dev $ost1mnt $ost1opts &
+	do_facet ost1 $MOUNT_TGT $ost1dev $ost1mnt $ost1opts &
 	pid=$!
 
-	do_facet ost1 mount -t lustre $ost1dev $ost1mnt $ost1opts
+	do_facet ost1 $MOUNT_TGT $ost1dev $ost1mnt $ost1opts
 	rc2=$?
 	wait $pid
 	rc=$?

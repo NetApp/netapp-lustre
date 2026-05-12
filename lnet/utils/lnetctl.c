@@ -5824,7 +5824,7 @@ old_api:
 		goto err;
 	}
 
-	yaml_blk = buf = malloc(st.st_size);
+	yaml_blk = buf = malloc(st.st_size + 1);
 	if (!yaml_blk) {
 		rc = -ENOMEM;
 		snprintf(err_str, sizeof(err_str),
@@ -5835,10 +5835,11 @@ old_api:
 				  &err_rc);
 		goto err;
 	}
-	len = st.st_size;
+	len = st.st_size + 1;
 
-	while (fgets(buf, len, input) != NULL) {
+	while (len > 1 && fgets(buf, len, input) != NULL) {
 		char *seq = strstr(buf, "-     ");
+		size_t n;
 
 		if (seq) {
 			int skip;
@@ -5854,8 +5855,9 @@ old_api:
 			 */
 			release = false;
 		}
-		buf += strlen(buf);
-		len -= strlen(buf);
+		n = strlen(buf);
+		buf += n;
+		len -= n;
 	}
 
 	switch (cmd) {

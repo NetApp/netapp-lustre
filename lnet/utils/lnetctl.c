@@ -2075,6 +2075,7 @@ static int yaml_lnet_config_ni(char *net_id, char *ip2net,
 	struct lnet_dlc_intf_descr *intf;
 	struct nl_sock *sk = NULL;
 	const char *msg = NULL;
+	const struct lnet_dlc_intf_descr *nid_intf = NULL, *real_intf = NULL;
 	yaml_emitter_t output;
 	yaml_parser_t reply;
 	yaml_event_t event;
@@ -2216,9 +2217,26 @@ static int yaml_lnet_config_ni(char *net_id, char *ip2net,
 	if (rc == 0)
 		goto emitter_error;
 
+	/* Check if we have both NID and interface to combine */
+	list_for_each_entry(intf, &nw_descr->nw_intflist, intf_on_network) {
+		if (strchr(intf->intf_name, '@') ||
+		    (strcmp(intf->intf_name, "<?>") == 0 &&
+		     flags == NLM_F_REPLACE))
+			nid_intf = intf;
+		else
+			real_intf = intf;
+	}
+
 	list_for_each_entry(intf, &nw_descr->nw_intflist,
 			    intf_on_network) {
 		struct cfs_expr_list *cpt_expr = NULL;
+		bool is_nid = strchr(intf->intf_name, '@') ||
+			      (strcmp(intf->intf_name, "<?>") == 0 &&
+			       flags == NLM_F_REPLACE);
+
+		/* Skip NID if we're processing real_intf and both exist */
+		if (nid_intf && real_intf && is_nid)
+			continue;
 
 		yaml_mapping_start_event_initialize(&event, NULL,
 						    (yaml_char_t *)YAML_MAP_TAG,
@@ -2227,10 +2245,29 @@ static int yaml_lnet_config_ni(char *net_id, char *ip2net,
 		if (rc == 0)
 			goto emitter_error;
 
-		/* Use NI addresses instead of interface */
-		if (strchr(intf->intf_name, '@') ||
-		    (strcmp(intf->intf_name, "<?>") == 0 &&
--                    flags == NLM_F_REPLACE)) {
+		/* If both NID and interface exist, emit NID first */
+		if (nid_intf && real_intf && !is_nid) {
+			yaml_scalar_event_initialize(
+				&event, NULL, (yaml_char_t *)YAML_STR_TAG,
+				(yaml_char_t *)"nid",
+				strlen("nid"), 1, 0,
+				YAML_PLAIN_SCALAR_STYLE);
+			rc = yaml_emitter_emit(&output, &event);
+			if (rc == 0)
+				goto emitter_error;
+
+			yaml_scalar_event_initialize(
+				&event, NULL, (yaml_char_t *)YAML_STR_TAG,
+				(yaml_char_t *)nid_intf->intf_name,
+				strlen(nid_intf->intf_name), 1, 0,
+				YAML_PLAIN_SCALAR_STYLE);
+			rc = yaml_emitter_emit(&output, &event);
+			if (rc == 0)
+				goto emitter_error;
+		}
+
+		/* Emit NID or interface */
+		if (is_nid) {
 			yaml_scalar_event_initialize(&event, NULL,
 						     (yaml_char_t *)YAML_STR_TAG,
 						     (yaml_char_t *)"nid",
@@ -5013,6 +5050,7 @@ handle_net_config_sequence(yaml_parser_t *setup, int flags,
 	char errmsg[LNET_MAX_STR_LEN];
 	bool tunables_set = false;
 	bool lnd_tunables_set = false;
+	bool nid_specified = false;
 	/* Track configured networks to ensure uniqueness for ip2nets */
 	__u32 *configured_nets = NULL;
 	size_t nets_cnt = 0;
@@ -5071,23 +5109,28 @@ handle_net_config_sequence(yaml_parser_t *setup, int flags,
 			size_t i;
 			__u32 *tmp;
 
-			rc = lustre_lnet_resolve_ip2nets_rule(&ip2nets, &nids,
-							      &nnids, errmsg,
-							      sizeof(errmsg));
-			if (nids)
-				free(nids);
-
-			/* NO_MATCH is okay for ip2nets, but anything else is
-			 * an error
+			/* When an explicit 'nid:' was supplied, the NI address
+			 * is already known: skip ip2nets resolution
 			 */
-			if (rc != LUSTRE_CFG_RC_NO_ERR &&
-			    !(is_ip2nets_sequence &&
-			      rc == LUSTRE_CFG_RC_NO_MATCH))
-				goto print_error;
+			if (!nid_specified) {
+				rc = lustre_lnet_resolve_ip2nets_rule(
+					&ip2nets, &nids, &nnids, errmsg,
+					sizeof(errmsg));
+				if (nids)
+					free(nids);
 
-			/* Skip configuration if resolution failed */
-			if (rc != LUSTRE_CFG_RC_NO_ERR)
-				goto cleanup_block;
+				/* NO_MATCH is okay for ip2nets, but anything
+				 * else is an error
+				 */
+				if (rc != LUSTRE_CFG_RC_NO_ERR &&
+				    !(is_ip2nets_sequence &&
+				      rc == LUSTRE_CFG_RC_NO_MATCH))
+					goto print_error;
+
+				/* Skip configuration if resolution failed */
+				if (rc != LUSTRE_CFG_RC_NO_ERR)
+					goto cleanup_block;
+			}
 
 			/* Check for duplicate networks in ip2nets sequences */
 			for (i = 0; i < nets_cnt; i++) {
@@ -5139,6 +5182,7 @@ cleanup_block:
 				cfs_expr_list_free(global_cpts);
 			global_cpts = NULL;
 			tunables_set = lnd_tunables_set = false;
+			nid_specified = false;
 		}
 
 		/* Skip other events we do not care about */
@@ -5200,6 +5244,49 @@ cleanup_block:
 			} else if (!rc) {
 				goto yaml_parser_error;
 			}
+		} else if (!strcmp(value, "nid")) {
+			if (is_ip2nets_sequence) {
+				snprintf(errmsg, LNET_MAX_STR_LEN,
+					 "'nid' not valid for ip2nets");
+				rc = -EINVAL;
+				goto print_error;
+			}
+
+			yaml_event_delete(&event);
+
+			rc = yaml_parser_parse(setup, &event);
+			if (!rc)
+				goto yaml_parser_error;
+
+			if (event.type != YAML_SCALAR_EVENT) {
+				snprintf(errmsg, LNET_MAX_STR_LEN,
+					 "Missing value for 'nid'");
+				rc = -EINVAL;
+				goto print_error;
+			}
+
+			value = (char *)event.data.scalar.value;
+			if (!strchr(value, '@')) {
+				snprintf(errmsg, LNET_MAX_STR_LEN,
+					 "Invalid NID '%s'", value);
+				rc = -EINVAL;
+				goto print_error;
+			}
+
+			/* Parse as '--nid' option does for "net add": keep the
+			 * full NID string (with '@') as the interface
+			 * descriptor so yaml_lnet_config_ni() emits it as a
+			 * 'nid:' netlink event, preserving the explicit address
+			 * family.
+			 */
+			rc = lustre_lnet_parse_interfaces(value, nw_descr);
+			if (rc != LUSTRE_CFG_RC_NO_ERR) {
+				snprintf(errmsg, LNET_MAX_STR_LEN,
+					 "Failed to parse NID '%s'", value);
+				rc = -EINVAL;
+				goto print_error;
+			}
+			nid_specified = true;
 		} else if (!strcmp(value, "local NI(s)")) {
 			if (is_ip2nets_sequence) {
 				snprintf(errmsg, LNET_MAX_STR_LEN,

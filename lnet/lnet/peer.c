@@ -1804,6 +1804,7 @@ out:
  * Error codes:
  *  -EPERM:    Non-DLC addition to a DLC-configured peer.
  *  -EEXIST:   The NID was configured by DLC for a different peer.
+ *  -EALREADY: The NID is already part of another locked MR peer.
  *  -ENOMEM:   Out of memory.
  *  -ENOTUNIQ: Adding a second peer NID on a single network on a
  *             non-multi-rail peer.
@@ -1875,6 +1876,7 @@ lnet_peer_add_nid(struct lnet_peer *lp, struct lnet_nid *nid,
 			spin_lock(&lp2->lp_lock);
 			if (lp2->lp_state & LNET_PEER_LOCK_PRIMARY &&
 			    lp2->lp_nnis > 1) {
+				rc = -EALREADY;
 				lp2->lp_state |= LNET_PEER_BAD_CONFIG;
 				spin_unlock(&lp2->lp_lock);
 				spin_lock(&lp->lp_lock);
@@ -1906,6 +1908,10 @@ lnet_peer_add_nid(struct lnet_peer *lp, struct lnet_nid *nid,
 				lp->lp_prim_lock_ts = peer2_prim_lock_ts;
 				lp->lp_primary_nid = *nid;
 				lp->lp_state |= LNET_PEER_LOCK_PRIMARY;
+				CDEBUG(D_NET, "new_primary=%s state=%#x ts=%llu\n",
+				       libcfs_nidstr(&lp->lp_primary_nid),
+				       lp->lp_state,
+				       (unsigned long long)lp->lp_prim_lock_ts);
 			}
 			spin_unlock(&lp->lp_lock);
 			/*
@@ -1984,6 +1990,10 @@ lnet_peer_set_primary_nid(struct lnet_peer *lp, struct lnet_nid *nid,
 		goto out;
 	}
 out:
+
+	if (rc == -EALREADY)
+		return rc;
+
 	/* if this is a configured peer or the primary for that peer has
 	 * been locked, then we don't want to flag this scenario as
 	 * a failure
@@ -2488,7 +2498,14 @@ static void lnet_peer_discovery_complete(struct lnet_peer *lp, int dc_error)
 	lp->lp_state &= ~LNET_PEER_DISCOVERING;
 	if (dc_error) {
 		lp->lp_dc_error = dc_error;
-		lp->lp_state |= LNET_PEER_REDISCOVER;
+		/*
+		 * A locked-primary peer conflict is a persistent,
+		 * not a transient discovery failure. The peer has
+		 * been marked BAD_CONFIG already, so do not immediately
+		 * rediscover and hit the same conflict again.
+		 */
+		if (dc_error != -EALREADY)
+			lp->lp_state |= LNET_PEER_REDISCOVER;
 	}
 	list_splice_init(&lp->lp_dc_pendq, &pending_msgs);
 	spin_unlock(&lp->lp_lock);
@@ -3399,7 +3416,7 @@ static int lnet_peer_merge_data(struct lnet_peer *lp,
 			CERROR("Error adding NID %s to peer %s: %d\n",
 			       libcfs_nidstr(&addnis[i].ns_nid),
 			       libcfs_nidstr(&lp->lp_primary_nid), rc);
-			if (rc == -ENOMEM)
+			if (rc == -ENOMEM || rc == -EALREADY)
 				goto out;
 		}
 		lpni = lnet_peer_ni_find_locked(&addnis[i].ns_nid);
@@ -3472,7 +3489,8 @@ out:
 	if (rc) {
 		spin_lock(&lp->lp_lock);
 		lp->lp_state &= ~LNET_PEER_NIDS_UPTODATE;
-		lp->lp_state |= LNET_PEER_FORCE_PING;
+		if (rc != -EALREADY)
+			lp->lp_state |= LNET_PEER_FORCE_PING;
 		spin_unlock(&lp->lp_lock);
 	}
 	return rc;
@@ -3697,10 +3715,13 @@ __must_hold(&lp->lp_lock)
 	 * which causes the peers to merge.
 	 */
 	if (!LNET_NID_IS_ANY(&lp->lp_merge_primary_nid)) {
-
-		lnet_peer_set_primary_nid(lp, &lp->lp_merge_primary_nid,
+		rc = lnet_peer_set_primary_nid(lp, &lp->lp_merge_primary_nid,
 					  flags);
 		lp->lp_merge_primary_nid = LNET_ANY_NID;
+		if (rc) {
+			kref_put(&pbuf->pb_refcnt, lnet_ping_buffer_free);
+			goto out;
+		}
 	}
 
 	if (nid_is_lo0(&lp->lp_primary_nid)) {

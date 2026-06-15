@@ -4616,21 +4616,21 @@ out_free_key:
 }
 
 static void
-free_ip2nets_lists(struct lustre_lnet_ip2nets *ip2nets)
+free_net_config_lists(struct lustre_lnet_ip2nets *net_config)
 {
 	struct lustre_lnet_ip_range_descr *ip_range_descr = NULL,
 					  *tmp = NULL;
 	struct lnet_dlc_intf_descr *intf_descr, *intf_tmp;
 
 	list_for_each_entry_safe(intf_descr, intf_tmp,
-				 &ip2nets->ip2nets_net.nw_intflist,
+				 &net_config->net.nw_intflist,
 				 intf_on_network) {
 		list_del(&intf_descr->intf_on_network);
 		free_intf_descr(intf_descr);
 	}
 
 	list_for_each_entry_safe(ip_range_descr, tmp,
-				 &ip2nets->ip2nets_ip_ranges,
+				 &net_config->ip_ranges,
 				 ipr_entry) {
 		struct cfs_expr_list *el, *el_tmp;
 
@@ -4853,14 +4853,13 @@ out_free_key:
 }
 
 static void
-init_ip2nets_tunables(struct lustre_lnet_ip2nets *ip2nets,
+init_net_config_tunables(struct lustre_lnet_ip2nets *net_config,
 		      struct lnet_ioctl_config_lnd_tunables *tunables)
 {
-	INIT_LIST_HEAD(&ip2nets->ip2nets_ip_ranges);
-	INIT_LIST_HEAD(&ip2nets->ip2nets_net.network_on_rule);
-	INIT_LIST_HEAD(&ip2nets->ip2nets_net.nw_intflist);
+	INIT_LIST_HEAD(&net_config->ip_ranges);
+	INIT_LIST_HEAD(&net_config->net.nw_intflist);
 
-	ip2nets->ip2nets_net.nw_id = LNET_NET_ANY;
+	net_config->net.nw_id = LNET_NET_ANY;
 
 	memset(tunables, 0, sizeof(*tunables));
 	tunables->lt_cmn.lct_peer_timeout = -1;
@@ -4999,6 +4998,38 @@ yaml_parser_error:
 	return rc;
 }
 
+/* Per-NI configuration state for a single entry in a 'local NI(s):' block */
+struct ni_import_entry {
+	struct list_head		list;
+	struct lnet_dlc_network_descr	ni_descr;
+	struct lnet_ioctl_config_lnd_tunables tunables;
+	struct cfs_expr_list		*cpts;
+	bool				tunables_set;
+	bool				lnd_tunables_set;
+	bool				nid_specified;
+};
+
+static void
+free_ni_list(struct list_head *ni_list)
+{
+	struct ni_import_entry *entry, *tmp;
+
+	list_for_each_entry_safe(entry, tmp, ni_list, list) {
+		struct lnet_dlc_intf_descr *intf_descr, *intf_tmp;
+
+		list_del(&entry->list);
+		list_for_each_entry_safe(intf_descr, intf_tmp,
+					 &entry->ni_descr.nw_intflist,
+					 intf_on_network) {
+			list_del(&intf_descr->intf_on_network);
+			free_intf_descr(intf_descr);
+		}
+		if (entry->cpts)
+			cfs_expr_list_free(entry->cpts);
+		free(entry);
+	}
+}
+
 /*
  * ip2nets:
  *  - net-spec: <net>[NUM]
@@ -5023,26 +5054,26 @@ yaml_parser_error:
  *
  * net:
  *  - net type: <net>[NUM]
- *    interfaces:
- *        0: <intf name>['['<expr>']']
- *        1: <intf name>['['<expr>']']
- *    tunables:
- *          peer_timeout: <NUM>
- *          peer_credits: <NUM>
- *          peer_buffer_credits: <NUM>
- *          credits: <NUM>
- *    lnd tunables:
- *          <lnd_param1>: <val>
- *          <lnd_param2>: <val>
- *          <...>
- *    CPT: "[<expr]"
+ *    local NI(s):
+ *      - interfaces:
+ *              0: <intf name>['['<expr>']']
+ *        tunables:
+ *              peer_timeout: <NUM>
+ *              ...
+ *        lnd tunables:
+ *              <lnd_param1>: <val>
+ *        CPT: "[<expr]"
+ *      - interfaces:
+ *              ...
+ *    tunables:       <- net-level, applies to all NIs lacking per-NI tunables
+ *          ...
  */
 static int
 handle_net_config_sequence(yaml_parser_t *setup, int flags,
 			   bool is_ip2nets_sequence)
 {
-	struct lustre_lnet_ip2nets ip2nets;
-	struct lnet_dlc_network_descr *nw_descr = &ip2nets.ip2nets_net;
+	struct lustre_lnet_ip2nets net_config;
+	struct lnet_dlc_network_descr *nw_descr = &net_config.net;
 	struct lnet_ioctl_config_lnd_tunables tunables;
 	struct cfs_expr_list *global_cpts = NULL;
 	yaml_event_t event;
@@ -5056,8 +5087,12 @@ handle_net_config_sequence(yaml_parser_t *setup, int flags,
 	size_t nets_cnt = 0;
 	unsigned int seq_depth = 0;
 	unsigned int map_depth = 0;
+	/* Per-NI state for 'net:' format with 'local NI(s):' block */
+	struct list_head ni_list;
+	struct ni_import_entry *cur_ni = NULL;
 
-	init_ip2nets_tunables(&ip2nets, &tunables);
+	INIT_LIST_HEAD(&ni_list);
+	init_net_config_tunables(&net_config, &tunables);
 
 	while (1) {
 		char *value;
@@ -5083,6 +5118,36 @@ handle_net_config_sequence(yaml_parser_t *setup, int flags,
 			break;
 		}
 
+		/* Entering a per-NI mapping inside 'local NI(s):' */
+		if (event.type == YAML_MAPPING_START_EVENT && map_depth == 2 &&
+		    !is_ip2nets_sequence) {
+			cur_ni = calloc(1, sizeof(*cur_ni));
+			if (!cur_ni) {
+				rc = -ENOMEM;
+				snprintf(errmsg, sizeof(errmsg),
+					 "Out of memory for NI entry");
+				yaml_event_delete(&event);
+				goto print_error;
+			}
+			INIT_LIST_HEAD(&cur_ni->ni_descr.nw_intflist);
+			INIT_LIST_HEAD(&cur_ni->list);
+			cur_ni->ni_descr.nw_id = net_config.net.nw_id;
+
+			memset(&cur_ni->tunables, 0,
+			       sizeof(cur_ni->tunables));
+			cur_ni->tunables.lt_cmn.lct_peer_timeout = -1;
+			cur_ni->tunables.lt_cmn.lct_peer_tx_credits = -1;
+			cur_ni->tunables.lt_cmn.lct_peer_rtr_credits = -1;
+			cur_ni->tunables.lt_cmn.lct_max_tx_credits = -1;
+			if (LNET_NETTYP(cur_ni->ni_descr.nw_id) == SOCKLND)
+				cur_ni->tunables.lt_tun.lnd_tun_u
+					.lnd_sock.lnd_tos = -1;
+			else if (LNET_NETTYP(cur_ni->ni_descr.nw_id) == O2IBLND)
+				cur_ni->tunables.lt_tun.lnd_tun_u
+					.lnd_o2ib.lnd_tos = -1;
+			list_add_tail(&cur_ni->list, &ni_list);
+		}
+
 		/* Reached the end of the ip2nets/net sequence */
 		if (event.type == YAML_SEQUENCE_END_EVENT && seq_depth == 0) {
 			yaml_event_delete(&event);
@@ -5099,85 +5164,140 @@ handle_net_config_sequence(yaml_parser_t *setup, int flags,
 			goto out;
 		}
 
+		/* Reached the end of a per-NI mapping inside 'local NI(s):' */
+		if (event.type == YAML_MAPPING_END_EVENT && map_depth == 1 &&
+		    !is_ip2nets_sequence && cur_ni) {
+			cur_ni = NULL;
+			yaml_event_delete(&event);
+			continue;
+		}
+
 		/* Reached the end of a network specification block */
 		if (event.type == YAML_MAPPING_END_EVENT && map_depth == 0) {
-			struct lnet_ioctl_config_lnd_tunables *tun = NULL;
-			char *net;
-			lnet_nid_t *nids = NULL;
-			__u32 nnids = 0;
-			bool duplicate_net = false;
-			size_t i;
-			__u32 *tmp;
+			char *net = libcfs_net2str(net_config.net.nw_id);
 
-			/* When an explicit 'nid:' was supplied, the NI address
-			 * is already known: skip ip2nets resolution
-			 */
-			if (!nid_specified) {
+			if (!is_ip2nets_sequence) {
+				/*
+				 * net: format — configure each NI in the
+				 * 'local NI(s):' list individually so that
+				 * per-NI CPTs and tunables are honoured.
+				 */
+				struct ni_import_entry *ni_entry, *ni_tmp;
+
+				if (list_empty(&ni_list)) {
+					snprintf(errmsg, sizeof(errmsg),
+						 "No 'local NI(s):' specified for net '%s'",
+						 net);
+					rc = -EINVAL;
+					goto print_error;
+				}
+
+				list_for_each_entry_safe(ni_entry, ni_tmp,
+							 &ni_list,
+							 list) {
+					struct lnet_ioctl_config_lnd_tunables *tun = NULL;
+					struct cfs_expr_list *cpts;
+
+					/* NI-level tunables take
+					 * precedence over net-level;
+					 * fall back to net-level when
+					 * this NI has none.
+					 */
+					if (ni_entry->tunables_set ||
+					    ni_entry->lnd_tunables_set)
+						tun = &ni_entry->tunables;
+					else if (tunables_set ||
+						 lnd_tunables_set)
+						tun = &tunables;
+
+					cpts = ni_entry->cpts ?
+						ni_entry->cpts :
+						global_cpts;
+
+					rc = yaml_lnet_config_ni(
+						net, NULL,
+						&ni_entry->ni_descr,
+						tun, -1, cpts,
+						LNET_GENL_VERSION,
+						flags, stdout);
+					if (rc < 0) {
+						snprintf(errmsg,
+							 sizeof(errmsg),
+							 "Failed to configure NI on net '%s' rc = %d",
+							 net, rc);
+						free_ni_list(&ni_list);
+						goto print_error;
+					}
+				}
+				free_ni_list(&ni_list);
+				INIT_LIST_HEAD(&ni_list);
+			} else {
+				/* ip2nets format: resolve then configure */
+				struct lnet_ioctl_config_lnd_tunables *tun = NULL;
+				lnet_nid_t *nids = NULL;
+				__u32 nnids = 0;
+				bool duplicate_net = false;
+				size_t i;
+				__u32 *tmp;
+
 				rc = lustre_lnet_resolve_ip2nets_rule(
-					&ip2nets, &nids, &nnids, errmsg,
+					&net_config, &nids, &nnids, errmsg,
 					sizeof(errmsg));
 				if (nids)
 					free(nids);
 
-				/* NO_MATCH is okay for ip2nets, but anything
-				 * else is an error
-				 */
+				/* NO_MATCH is okay for ip2nets */
 				if (rc != LUSTRE_CFG_RC_NO_ERR &&
-				    !(is_ip2nets_sequence &&
-				      rc == LUSTRE_CFG_RC_NO_MATCH))
+				    rc != LUSTRE_CFG_RC_NO_MATCH)
 					goto print_error;
 
-				/* Skip configuration if resolution failed */
 				if (rc != LUSTRE_CFG_RC_NO_ERR)
 					goto cleanup_block;
-			}
 
-			/* Check for duplicate networks in ip2nets sequences */
-			for (i = 0; i < nets_cnt; i++) {
-				if (configured_nets[i] ==
-				    ip2nets.ip2nets_net.nw_id) {
-					duplicate_net = true;
-					break;
+				/* Check for duplicate networks */
+				for (i = 0; i < nets_cnt; i++) {
+					if (configured_nets[i] ==
+					    net_config.net.nw_id) {
+						duplicate_net = true;
+						break;
+					}
 				}
+
+				if (duplicate_net)
+					goto cleanup_block;
+
+				if (tunables_set || lnd_tunables_set)
+					tun = &tunables;
+
+				rc = yaml_lnet_config_ni(
+					net, NULL, &net_config.net,
+					tun, -1, global_cpts,
+					LNET_GENL_VERSION, flags, stdout);
+				if (rc < 0) {
+					snprintf(errmsg, sizeof(errmsg),
+						 "Failed to configure NI on net '%s' rc = %d",
+						 net, rc);
+					goto print_error;
+				}
+
+				tmp = realloc(configured_nets,
+					      (nets_cnt + 1) *
+					      sizeof(*configured_nets));
+				if (!tmp) {
+					rc = -ENOMEM;
+					snprintf(errmsg, sizeof(errmsg),
+						 "Out of memory tracking configured nets");
+					goto print_error;
+				}
+				configured_nets = tmp;
+				configured_nets[nets_cnt] =
+					net_config.net.nw_id;
+				nets_cnt++;
 			}
-
-			/* Skip configuration for ip2nets if duplicate */
-			if (duplicate_net && is_ip2nets_sequence)
-				goto cleanup_block;
-
-			/* Configure the network interface */
-			net = libcfs_net2str(ip2nets.ip2nets_net.nw_id);
-			if (tunables_set || lnd_tunables_set)
-				tun = &tunables;
-
-			rc = yaml_lnet_config_ni(net, NULL,
-						 &ip2nets.ip2nets_net, tun, -1,
-						 global_cpts, LNET_GENL_VERSION,
-						 flags, stdout);
-			if (rc < 0) {
-				snprintf(errmsg, sizeof(errmsg),
-					 "Failed to configure NI on net '%s' rc = %d",
-					 net, rc);
-				goto print_error;
-			}
-
-			/* Record successfully configured network for ip2nets */
-			tmp = realloc(configured_nets, (nets_cnt + 1) *
-				      sizeof(*configured_nets));
-
-			if (!tmp) {
-				rc = -ENOMEM;
-				snprintf(errmsg, sizeof(errmsg),
-					 "Out of memory tracking configured nets");
-				goto print_error;
-			}
-			configured_nets = tmp;
-			configured_nets[nets_cnt] = ip2nets.ip2nets_net.nw_id;
-			nets_cnt++;
 
 cleanup_block:
-			free_ip2nets_lists(&ip2nets);
-			init_ip2nets_tunables(&ip2nets, &tunables);
+			free_net_config_lists(&net_config);
+			init_net_config_tunables(&net_config, &tunables);
 			if (global_cpts)
 				cfs_expr_list_free(global_cpts);
 			global_cpts = NULL;
@@ -5196,7 +5316,7 @@ cleanup_block:
 		/* "net-spec" must be the first scalar for an ip2nets sequence,
 		 * and "net type" must be the first in a net sequence
 		 */
-		if (ip2nets.ip2nets_net.nw_id == LNET_NET_ANY) {
+		if (net_config.net.nw_id == LNET_NET_ANY) {
 			if (is_ip2nets_sequence && strcmp(value, "net-spec")) {
 				snprintf(errmsg, LNET_MAX_STR_LEN,
 					 "Malformed input. Expect 'net-spec' found '%s'",
@@ -5221,21 +5341,27 @@ cleanup_block:
 				goto yaml_parser_error;
 
 			value = (char *)event.data.scalar.value;
-			ip2nets.ip2nets_net.nw_id = libcfs_str2net(value);
-			if (ip2nets.ip2nets_net.nw_id == LNET_NET_ANY) {
+			net_config.net.nw_id = libcfs_str2net(value);
+			if (net_config.net.nw_id == LNET_NET_ANY) {
 				snprintf(errmsg, LNET_MAX_STR_LEN,
 					 "Invalid network ID '%s'",
 					 value);
 				rc = -EINVAL;
 				goto print_error;
 			}
-			init_lnd_tunables(LNET_NETTYP(ip2nets.ip2nets_net.nw_id),
+			init_lnd_tunables(LNET_NETTYP(net_config.net.nw_id),
 					  &tunables, &lnd_tunables_set);
 		} else if (!strcmp(value, "interfaces")) {
 			yaml_event_delete(&event);
 
-			rc = parse_yaml_list(setup, &nw_descr->nw_intflist,
-					     add_intf_helper);
+			if (cur_ni)
+				rc = parse_yaml_list(
+					setup, &cur_ni->ni_descr.nw_intflist,
+					add_intf_helper);
+			else
+				rc = parse_yaml_list(
+					setup, &nw_descr->nw_intflist,
+					add_intf_helper);
 			if (rc < 0) {
 				snprintf(errmsg, LNET_MAX_STR_LEN,
 					 "Failed to parse interfaces list rc = %d",
@@ -5245,11 +5371,23 @@ cleanup_block:
 				goto yaml_parser_error;
 			}
 		} else if (!strcmp(value, "nid")) {
+			struct lnet_dlc_network_descr *ni_descr;
+			bool *ni_nid_specified;
+
 			if (is_ip2nets_sequence) {
 				snprintf(errmsg, LNET_MAX_STR_LEN,
 					 "'nid' not valid for ip2nets");
 				rc = -EINVAL;
 				goto print_error;
+			}
+
+			/* Route to per-NI or net-level descriptor */
+			if (cur_ni) {
+				ni_descr = &cur_ni->ni_descr;
+				ni_nid_specified = &cur_ni->nid_specified;
+			} else {
+				ni_descr = nw_descr;
+				ni_nid_specified = &nid_specified;
 			}
 
 			yaml_event_delete(&event);
@@ -5279,14 +5417,14 @@ cleanup_block:
 			 * 'nid:' netlink event, preserving the explicit address
 			 * family.
 			 */
-			rc = lustre_lnet_parse_interfaces(value, nw_descr);
+			rc = lustre_lnet_parse_interfaces(value, ni_descr);
 			if (rc != LUSTRE_CFG_RC_NO_ERR) {
 				snprintf(errmsg, LNET_MAX_STR_LEN,
 					 "Failed to parse NID '%s'", value);
 				rc = -EINVAL;
 				goto print_error;
 			}
-			nid_specified = true;
+			*ni_nid_specified = true;
 		} else if (!strcmp(value, "local NI(s)")) {
 			if (is_ip2nets_sequence) {
 				snprintf(errmsg, LNET_MAX_STR_LEN,
@@ -5304,7 +5442,7 @@ cleanup_block:
 
 			yaml_event_delete(&event);
 
-			rc = parse_yaml_list(setup, &ip2nets.ip2nets_ip_ranges,
+			rc = parse_yaml_list(setup, &net_config.ip_ranges,
 					     lustre_lnet_add_ip_range);
 			if (rc < 0) {
 				snprintf(errmsg, LNET_MAX_STR_LEN,
@@ -5315,10 +5453,21 @@ cleanup_block:
 				goto yaml_parser_error;
 			}
 		} else if (!strcmp(value, "tunables")) {
+			struct lnet_ioctl_config_lnd_tunables *tgt_tun;
+			bool *tgt_set;
+
 			yaml_event_delete(&event);
 
-			rc = parse_yaml_tunables(ip2nets.ip2nets_net.nw_id,
-						 &tunables, setup, flags,
+			if (cur_ni) {
+				tgt_tun = &cur_ni->tunables;
+				tgt_set = &cur_ni->tunables_set;
+			} else {
+				tgt_tun = &tunables;
+				tgt_set = &tunables_set;
+			}
+
+			rc = parse_yaml_tunables(net_config.net.nw_id,
+						 tgt_tun, setup, flags,
 						 handle_cmn_tunable);
 			if (rc < 0) {
 				snprintf(errmsg, LNET_MAX_STR_LEN,
@@ -5328,12 +5477,23 @@ cleanup_block:
 			} else if (!rc) {
 				goto yaml_parser_error;
 			}
-			tunables_set = true;
+			*tgt_set = true;
 		} else if (!strcmp(value, "lnd tunables")) {
+			struct lnet_ioctl_config_lnd_tunables *tgt_tun;
+			bool *tgt_set;
+
 			yaml_event_delete(&event);
 
-			rc = parse_yaml_tunables(ip2nets.ip2nets_net.nw_id,
-						 &tunables, setup, flags,
+			if (cur_ni) {
+				tgt_tun = &cur_ni->tunables;
+				tgt_set = &cur_ni->lnd_tunables_set;
+			} else {
+				tgt_tun = &tunables;
+				tgt_set = &lnd_tunables_set;
+			}
+
+			rc = parse_yaml_tunables(net_config.net.nw_id,
+						 tgt_tun, setup, flags,
 						 handle_lnd_tunable);
 			if (rc < 0) {
 				snprintf(errmsg, LNET_MAX_STR_LEN,
@@ -5343,11 +5503,16 @@ cleanup_block:
 			} else if (!rc) {
 				goto yaml_parser_error;
 			}
-			lnd_tunables_set = true;
+			*tgt_set = true;
 		} else if (!strcmp(value, "CPT")) {
-			rc = handle_cpt_sequence(setup, &event,
-						 &global_cpts, flags);
-			if (rc < 0 || !global_cpts)
+			struct cfs_expr_list **tgt_cpts;
+
+			/* Per-NI CPT if inside a NI block, else net-level */
+			tgt_cpts = cur_ni ? &cur_ni->cpts : &global_cpts;
+
+			rc = handle_cpt_sequence(setup, &event, tgt_cpts,
+						 flags);
+			if (rc < 0 || !*tgt_cpts)
 				goto out;
 
 			/* handle_cpt_sequence() deletes the last event that
@@ -5370,7 +5535,8 @@ yaml_parser_error:
 		rc = -EINVAL;
 	}
 out:
-	free_ip2nets_lists(&ip2nets);
+	free_ni_list(&ni_list);
+	free_net_config_lists(&net_config);
 	if (configured_nets)
 		free(configured_nets);
 	if (global_cpts)

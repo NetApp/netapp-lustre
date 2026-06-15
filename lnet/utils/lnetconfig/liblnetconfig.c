@@ -358,7 +358,6 @@ void lustre_lnet_init_nw_descr(struct lnet_dlc_network_descr *nw_descr)
 {
 	if (nw_descr != NULL) {
 		nw_descr->nw_id = 0;
-		INIT_LIST_HEAD(&nw_descr->network_on_rule);
 		INIT_LIST_HEAD(&nw_descr->nw_intflist);
 	}
 }
@@ -2082,16 +2081,16 @@ int lustre_lnet_resolve_ip2nets_rule(struct lustre_lnet_ip2nets *ip2nets,
 	}
 
 	rc = lustre_lnet_match_ip_to_intf(ifa,
-					  &ip2nets->ip2nets_net.nw_intflist,
-					  &ip2nets->ip2nets_ip_ranges, err_str,
+					  &ip2nets->net.nw_intflist,
+					  &ip2nets->ip_ranges, err_str,
 					  str_len,
-					  ip2nets->ip2nets_net.nw_id);
+					  ip2nets->net.nw_id);
 	if (rc != LUSTRE_CFG_RC_MATCH) {
 		freeifaddrs(ifa);
 		return rc;
 	}
 
-	rc = lustre_lnet_intf2nids(&ip2nets->ip2nets_net, nids, nnids,
+	rc = lustre_lnet_intf2nids(&ip2nets->net, nids, nnids,
 				   err_str, str_len);
 	if (rc != LUSTRE_CFG_RC_NO_ERR) {
 		*nids = NULL;
@@ -2509,13 +2508,13 @@ lustre_lnet_config_ip2nets(struct lustre_lnet_ip2nets *ip2nets,
 	if (rc != LUSTRE_CFG_RC_NO_ERR && rc != LUSTRE_CFG_RC_MATCH)
 		goto out;
 
-	if (list_empty(&ip2nets->ip2nets_net.nw_intflist)) {
+	if (list_empty(&ip2nets->net.nw_intflist)) {
 		snprintf(err_str, sizeof(err_str),
 			 "\"no interfaces match ip2nets rules\"");
 		goto free_nids_out;
 	}
 
-	rc = lustre_lnet_ioctl_config_ni(&ip2nets->ip2nets_net.nw_intflist,
+	rc = lustre_lnet_ioctl_config_ni(&ip2nets->net.nw_intflist,
 					 tunables, global_cpts, nids,
 					 err_str);
 
@@ -5477,7 +5476,6 @@ static int handle_yaml_config_ni(struct cYAML *tree, struct cYAML **show_rc,
 						   LNET_NETTYP(nw_descr.nw_id));
 	seq_no = cYAML_get_object_item(tree, "seq_no");
 	while (cYAML_get_next_seq_item(local_nis, &local_ni) != NULL) {
-		INIT_LIST_HEAD(&nw_descr.network_on_rule);
 		INIT_LIST_HEAD(&nw_descr.nw_intflist);
 		intf = cYAML_get_object_item(local_ni, "interfaces");
 		if (intf == NULL)
@@ -5565,9 +5563,8 @@ static int handle_yaml_config_ip2nets(struct cYAML *tree,
 	memset(&tunables, 0, sizeof(tunables));
 
 	/* initialize all lists */
-	INIT_LIST_HEAD(&ip2nets.ip2nets_ip_ranges);
-	INIT_LIST_HEAD(&ip2nets.ip2nets_net.network_on_rule);
-	INIT_LIST_HEAD(&ip2nets.ip2nets_net.nw_intflist);
+	INIT_LIST_HEAD(&ip2nets.ip_ranges);
+	INIT_LIST_HEAD(&ip2nets.net.nw_intflist);
 
 	net = cYAML_get_object_item(tree, "net-spec");
 	if (net == NULL)
@@ -5577,15 +5574,15 @@ static int handle_yaml_config_ip2nets(struct cYAML *tree,
 		return LUSTRE_CFG_RC_BAD_PARAM;
 
 	/* assign the network id */
-	ip2nets.ip2nets_net.nw_id = libcfs_str2net(net->cy_valuestring);
-	if (ip2nets.ip2nets_net.nw_id == LNET_NET_ANY)
+	ip2nets.net.nw_id = libcfs_str2net(net->cy_valuestring);
+	if (ip2nets.net.nw_id == LNET_NET_ANY)
 		return LUSTRE_CFG_RC_BAD_PARAM;
 
 	seq_no = cYAML_get_object_item(tree, "seq_no");
 
 	intf = cYAML_get_object_item(tree, "interfaces");
 	if (intf != NULL) {
-		rc = yaml_copy_intf_info(intf, &ip2nets.ip2nets_net);
+		rc = yaml_copy_intf_info(intf, &ip2nets.net);
 		if (rc <= 0)
 			return LUSTRE_CFG_RC_BAD_PARAM;
 	}
@@ -5599,7 +5596,7 @@ static int handle_yaml_config_ip2nets(struct cYAML *tree,
 				continue;
 			}
 
-			rc = lustre_lnet_add_ip_range(&ip2nets.ip2nets_ip_ranges,
+			rc = lustre_lnet_add_ip_range(&ip2nets.ip_ranges,
 						      item->cy_valuestring);
 
 			if (rc != LUSTRE_CFG_RC_NO_ERR)
@@ -5610,7 +5607,7 @@ static int handle_yaml_config_ip2nets(struct cYAML *tree,
 	}
 
 	found = yaml_extract_tunables(tree, &tunables,
-				      LNET_NETTYP(ip2nets.ip2nets_net.nw_id));
+				      LNET_NETTYP(ip2nets.net.nw_id));
 	yaml_extract_cpt(tree, &global_cpts);
 
 	rc = lustre_lnet_config_ip2nets(&ip2nets,
@@ -5630,14 +5627,14 @@ static int handle_yaml_config_ip2nets(struct cYAML *tree,
 		rc = LUSTRE_CFG_RC_NO_ERR;
 out:
 	list_for_each_entry_safe(intf_descr, intf_tmp,
-				 &ip2nets.ip2nets_net.nw_intflist,
+				 &ip2nets.net.nw_intflist,
 				 intf_on_network) {
 		list_del(&intf_descr->intf_on_network);
 		free_intf_descr(intf_descr);
 	}
 
 	list_for_each_entry_safe(ip_range_descr, tmp,
-				 &ip2nets.ip2nets_ip_ranges,
+				 &ip2nets.ip_ranges,
 				 ipr_entry) {
 		list_del(&ip_range_descr->ipr_entry);
 		list_for_each_entry_safe(el, el_tmp, &ip_range_descr->ipr_expr,
@@ -5659,7 +5656,6 @@ static int handle_yaml_del_ni(struct cYAML *tree, struct cYAML **show_rc,
 	int num_entries, rc;
 	struct lnet_dlc_network_descr nw_descr;
 
-	INIT_LIST_HEAD(&nw_descr.network_on_rule);
 	INIT_LIST_HEAD(&nw_descr.nw_intflist);
 
 	net = cYAML_get_object_item(tree, "net type");

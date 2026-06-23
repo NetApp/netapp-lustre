@@ -41,7 +41,6 @@ if SERVER
 sbin_PROGRAMS += mkfs.lustre tunefs.lustre lr_reader lshowmount \
 		 ll_decode_filter_fid llog_reader l_tunedisk \
 		 ofd_access_log_reader check_iam
-rootsbin_SCRIPTS = mount.lustre_tgt
 endif
 if LIBPTHREAD
 sbin_PROGRAMS += lhsmtool_posix
@@ -148,7 +147,7 @@ endif
 if SERVER
 LIB_TARGETS += mount_osd_wbcfs.so
 endif
-endif # PLUGINS
+endif
 
 install-exec-hook:
 	@$(NORMAL_INSTALL)
@@ -161,10 +160,9 @@ install-exec-hook:
 	    $(INSTALL_DATA) $$p $(DESTDIR)$(libdir)/lustre/$$f; \
 	  else :; fi; \
 	done
-if SERVER
-	$(mkinstalldirs) $(DESTDIR)$(rootsbindir)
-	ln -sf mount.lustre $(DESTDIR)$(rootsbindir)/mount.lustre_tgt
-endif # SERVER
+	if [ "$(SERVER)" = "yes" ]; then \
+		ln -sf $(DESTDIR)$(sbindir)/mount.lustre $(DESTDIR)$(sbindir)/mount.lustre_tgt; \
+	fi
 endif # UTILS
 
 llog_reader_SOURCES = llog_reader.c
@@ -260,9 +258,6 @@ mount_lustre_LDFLAGS  := ${MNTMODLDFLAGS}
 mount_lustre_LDADD    := $(SELINUX) $(LDLIBMOUNT) $(PLUGIN_LIB) $(GSSLIB)
 mount_lustre_LDADD    += $(top_builddir)/libcfs/libcfs/libcfs.la $(MNTMODLIBS)
 mount_lustre_LDADD    += liblustreapi.la
-
-mount.lustre_tgt: mount.lustre
-	ln -sf mount.lustre mount.lustre_tgt
 
 mkfs_lustre_SOURCES = mkfs_lustre.c mount_utils.c mount_utils.h $(GSSSRC)
 mkfs_lustre_CPPFLAGS := -UTUNEFS ${MNTMODCFLAGS}
